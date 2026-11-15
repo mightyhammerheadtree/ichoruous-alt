@@ -271,34 +271,57 @@ Measured signatures for the imports the browser console reports most:
 None of these are implemented yet. They are logged here because the shape is
 half the work and re-deriving it costs a disassembler run each time.
 
-## The tutorial-room runaway is ours, not the game's
+## The tutorial-room runaway: what is established, and a correction
 
-Chasing this through the lifted wasm is hopeless, which is worth saying
-plainly because it cost a lot of time. `gml_Object_oMeatBlob_Create_0`
-lifts to 120 KB of wasm containing **1803 `loop` blocks**, 2804 `block`s
-and 3918 `if`s — none of which correspond to anything in the source. The
-x86 is ground truth, and it says the opposite:
+Chasing this through the lifted wasm wasted a lot of time, and one of the
+numbers behind it was simply wrong.
 
-* **2015 instructions, 133 branch instructions, 130 distinct branch
-  targets, and zero backward jumps** across `gml_Object_oMeatBlob_Create_0`
-  *and* all five of its anonymous struct methods (0x140b51d20–0x140b53aa0);
-* it makes **no direct call to any other GML function** — every call goes
-  out through the ABI dispatcher (`f140e634e0`), so a static call graph
-  from it has exactly one node and there is no callee to blame;
-* it therefore provably terminates. Executing it does not.
+**Correction.** An earlier note here claimed `gml_Object_oMeatBlob_Create_0`
+lifts to 1803 `loop` blocks, and leaned on that as evidence that the lifter
+invents loops. That count came from a **byte histogram of the function body**,
+which counts immediates that happen to equal an opcode byte. Decoding the
+body properly (`tools/gex/tmp/wcount.mjs`) gives:
 
-So the lifter produces the runaway. `tools/gex/tmp/callgraph.mjs` walks
-the x86 call graph from a root and reports backward jumps per function,
-which is how the "no callee" part was established.
+| opcode | real count | byte-histogram said |
+| ------ | ---------- | ------------------- |
+| `loop` | **1** | 1803 |
+| `br_table` | **1** | 125 |
+| `block` | 423 | 2804 |
+| `if` / `else` | 315 / 315 | 3918 |
+| `br` | 421 | 716 |
+| `call` | 444 | 534 |
+
+The gap is the whole argument: the lifted function has exactly **one** loop
+and **one** `br_table`, which is the dispatcher below, and nothing else that
+could cycle. The premise was an artefact. Do not histogram raw wasm bytes.
+
+**What is still established.** The original x86, across
+`gml_Object_oMeatBlob_Create_0` and all five of its anonymous struct methods
+(0x140b51d20–0x140b53aa0):
+
+* 2015 instructions, 133 branch instructions, 130 distinct branch targets,
+  **zero backward jumps**;
+* **no direct call to any other GML function** — every call leaves through the
+  ABI dispatcher, so a static call graph from it is a single node and there
+  is no callee to blame (`tools/gex/tmp/callgraph.mjs`).
+
+And the lifter's own block graph for it, extracted with
+`tools/gex/tmp/blockcycle.mjs`, is **99 blocks, a DAG, no cycle, no
+self-successor, and a clean non-overlapping extent** (0x140b51d20–0x140b52724).
+So the control-flow graph is not where the runaway comes from.
+
+Which leaves semantics rather than structure: a condition that always takes
+one arm, a `switch` whose table index is wrong, or a corrupted `BLOCKID`
+picking a block that was already visited. Still open.
 
 ### How the lifter compiles a function
 
-It does not translate branches into branches. `tools/gex/lift.js` builds a
-dispatcher state machine (`lift.js:284` onward):
+It does not translate branches into branches. `tools/gex/lift.js:284` builds a
+dispatcher state machine:
 
 ```wasm
 block                      ; exit target
-  loop                     ; the dispatcher
+  loop                     ; the dispatcher (the function's only loop)
     block × N              ; one per basic block
     block                  ; br_table default
     local.get BLOCKID
@@ -313,27 +336,18 @@ block                      ; exit target
 end
 ```
 
-Every terminator sets a `BLOCKID` local and branches back to the top of
-the `loop`, where `br_table` picks the next block. `blockDepth(j) = j`,
-`exitDepth(j) = j + 1`, and the `br_table` default is `N + 2` (return).
-
-This is why the `loop` count tells you nothing: the 1803 loops come from
-per-instruction expansions inside block bodies, not from the 130 real
-basic blocks. Counting them was a dead end.
-
-The ways this shape can spin are all in the successor computation: a
-`jcc` whose condition `condTo` mistranslates (`lift.js:356`), a block
-that falls through into the next body without setting `BLOCKID`, or an
-`idByVa` successor that maps back into the block that produced it. Since
-the x86 cannot loop, one of those is happening.
+Every terminator sets a `BLOCKID` local and branches back to the top, where
+`br_table` picks the next block. `blockDepth(j) = j`, `exitDepth(j) = j + 1`,
+`br_table` maps `i -> N - i`, and the default is `N + 2` (return). Verified by
+hand for N=2 and consistent with the decoded counts above.
 
 ### On using an x86 emulator
 
-v86 is 32-bit only — it cannot run this x86-64 PE, so "just emulate it"
-is not available. What *is* available, and what settled this question, is
-treating the x86 as ground truth and the wasm as a translation to be
-suspected: disassemble the original, count its real control flow, and
-believe that over anything the lifted module appears to be doing.
+v86 is 32-bit only — it cannot run this x86-64 PE, so "just emulate it" is
+not available. What *is* worth taking from the idea is treating the original
+x86 as ground truth and suspecting the translation; that is what produced the
+backward-jump and call-graph facts above. It is also what caught the bad
+count, since the two disagreed.
 
 ## Where the frame loop stands
 
